@@ -1,0 +1,29 @@
+# --- Kebutuhan API & ML ---
+fastapi
+uvicorn
+scikit-learn
+mlxtend
+
+# --- Kebutuhan Bersama (Hanya download 1x) ---
+psycopg2-binary
+sqlalchemy
+pandas
+numpy
+torch
+transformers
+sentence-transformers
+
+# --- Kebutuhan Big Data & Scraper ---
+streamlit
+feedparser
+newspaper3k
+nltk
+lxml_html_clean
+googlenewsdecoder
+google-api-python-client
+instaloader
+kafka-python
+pyspark==3.5.0
+plotly
+altair
+streamlit-autorefresh

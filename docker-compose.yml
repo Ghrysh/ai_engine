@@ -1,40 +1,176 @@
+version: '3.8'
+
 services:
+  # ==========================================
+  # 1. LARAVEL & WEB SERVER (API GATEWAY)
+  # ==========================================
   app:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: docker/Dockerfile.php
     container_name: ai_engine_app
     restart: unless-stopped
     working_dir: /var/www
     volumes:
       - ./:/var/www
+    env_file:
+      - .env
     depends_on:
       - db
+    networks:
+      - ai_network
 
   web:
     image: nginx:alpine
     container_name: ai_engine_web
     restart: unless-stopped
     ports:
-      - "8095:80"
+      - "8095:80" # Akses Dashboard Laravel di port 8095
     volumes:
       - ./:/var/www
-      - ./nginx/conf.d:/etc/nginx/conf.d
+      - ./nginx/conf.d:/etc/nginx/conf.d # Pastikan file conf Nginx Laravel ada di sini
     depends_on:
       - app
+    networks:
+      - ai_network
 
   db:
     image: postgres:15-alpine
     container_name: ai_engine_db
     restart: unless-stopped
     environment:
-      POSTGRES_DB: ${DB_DATABASE}
-      POSTGRES_USER: ${DB_USERNAME}
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ai_engine_db
+      POSTGRES_USER: ai_engine
+      POSTGRES_PASSWORD: p@5s@i_3n9ine
     volumes:
       - dbdata:/var/lib/postgresql/data
     ports:
       - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ai_engine -d ai_engine_db"] 
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ai_network
+
+  ews_ai_api:
+    build: 
+      context: .
+      dockerfile: docker/Dockerfile.python
+    container_name: ews_ai_api
+    restart: unless-stopped
+    working_dir: /var/www/ai_workers
+    volumes:
+      - ./:/var/www
+    depends_on:
+      - db
+    environment:
+      - DB_URL=postgresql://ai_engine:p@5s@i_3n9ine@db:5432/ai_engine_db 
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_DATABASE=ai_engine_db
+      - DB_USERNAME=ai_engine
+      - DB_PASSWORD=p@5s@i_3n9ine
+    command: uvicorn api_ai:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - ai_network
+
+  # ==========================================
+  # 3. KAFKA & ZOOKEEPER (Untuk Big Data)
+  # ==========================================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.0
+    container_name: ews_zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - ai_network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.3.0
+    container_name: ews_kafka
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "kafka:9092", "--list"]
+      interval: 30s
+      timeout: 20s
+      retries: 20
+    networks:
+      - ai_network
+
+  # ==========================================
+  # 4. BIG DATA WORKERS (Scraper, Spark, Streamlit)
+  # ==========================================
+  ews_scraper:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.python
+    container_name: ews_scraper
+    restart: on-failure:5
+    working_dir: /var/www/ai_workers
+    volumes:
+      - ./:/var/www
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      - PYTHONUNBUFFERED=1
+      - KAFKA_BROKER=kafka:9092
+    command: python3 scraper.py
+    networks:
+      - ai_network
+
+  ews_processor:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.python
+    container_name: ews_processor
+    working_dir: /var/www/ai_workers
+    volumes:
+      - ./:/var/www
+    depends_on:
+      kafka:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    command: >
+      spark-submit 
+      --jars /app/jars/postgresql-42.5.0.jar,/app/jars/spark-sql-kafka-0-10_2.12-3.5.0.jar,/app/jars/spark-token-provider-kafka-0-10_2.12-3.5.0.jar,/app/jars/kafka-clients-3.4.1.jar,/app/jars/commons-pool2-2.11.1.jar,/app/jars/hadoop-aws-3.3.4.jar,/app/jars/aws-java-sdk-bundle-1.12.262.jar
+      spark_processor.py
+    environment:
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+    networks:
+      - ai_network
+
+  ews_dashboard:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.python
+    container_name: ews_streamlit_app
+    restart: always
+    working_dir: /var/www/ai_workers
+    volumes:
+      - ./:/var/www
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8501:8501" # Akses UI Data Mining di port 8501
+    command: python3 -m streamlit run app_ews.py --server.port=8501 --server.address=0.0.0.0
+    networks:
+      - ai_network
+
+networks:
+  ai_network:
+    driver: bridge
 
 volumes:
   dbdata:
