@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   # ==========================================
-  # 1. LARAVEL & WEB SERVER (API GATEWAY)
+  # 1. LARAVEL & WEB SERVER (API GATEWAY AI ENGINE)
   # ==========================================
   app:
     build:
@@ -25,15 +25,16 @@ services:
     container_name: ai_engine_web
     restart: unless-stopped
     ports:
-      - "8095:80" # Akses Dashboard Laravel di port 8095
+      - "8095:80" 
     volumes:
       - ./:/var/www
-      - ./nginx/conf.d:/etc/nginx/conf.d # Pastikan file conf Nginx Laravel ada di sini
+      - ./nginx/conf.d:/etc/nginx/conf.d 
     depends_on:
       - app
     networks:
       - ai_network
 
+  # Database khusus untuk log API & registrasi engine (TIDAK menyimpang data EWS)
   db:
     image: postgres:15-alpine
     container_name: ai_engine_db
@@ -54,6 +55,9 @@ services:
     networks:
       - ai_network
 
+  # ==========================================
+  # 2. AI FASTAPI BACKEND
+  # ==========================================
   ews_ai_api:
     build: 
       context: .
@@ -63,15 +67,16 @@ services:
     working_dir: /var/www/ai_workers
     volumes:
       - ./:/var/www
-    depends_on:
-      - db
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
-      - DB_URL=postgresql://ai_engine:p@5s@i_3n9ine@db:5432/ai_engine_db 
-      - DB_HOST=db
-      - DB_PORT=5432
-      - DB_DATABASE=ai_engine_db
-      - DB_USERNAME=ai_engine
-      - DB_PASSWORD=p@5s@i_3n9ine
+      # Koneksi diarahkan ke Database EWS (ews-pkub) di Host
+      - DB_URL=postgresql://postgres:123@host.docker.internal:5441/ews_pkub 
+      - DB_HOST=host.docker.internal
+      - DB_PORT=5441
+      - DB_DATABASE=ews_pkub
+      - DB_USERNAME=postgres
+      - DB_PASSWORD=123
     command: uvicorn api_ai:app --host 0.0.0.0 --port 8000 --reload
     networks:
       - ai_network
@@ -118,12 +123,20 @@ services:
     working_dir: /var/www/ai_workers
     volumes:
       - ./:/var/www
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       kafka:
         condition: service_healthy
     environment:
       - PYTHONUNBUFFERED=1
       - KAFKA_BROKER=kafka:9092
+      - DB_URL=postgresql://postgres:123@host.docker.internal:5441/ews_pkub 
+      - DB_HOST=host.docker.internal
+      - DB_PORT=5441
+      - DB_DATABASE=ews_pkub
+      - DB_USERNAME=postgres
+      - DB_PASSWORD=123
     command: python3 scraper.py
     networks:
       - ai_network
@@ -136,10 +149,10 @@ services:
     working_dir: /var/www/ai_workers
     volumes:
       - ./:/var/www
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       kafka:
-        condition: service_healthy
-      db:
         condition: service_healthy
     command: >
       spark-submit 
@@ -147,6 +160,12 @@ services:
       spark_processor.py
     environment:
       - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - DB_URL=postgresql://postgres:123@host.docker.internal:5441/ews_pkub 
+      - DB_HOST=host.docker.internal
+      - DB_PORT=5441
+      - DB_DATABASE=ews_pkub
+      - DB_USERNAME=postgres
+      - DB_PASSWORD=123
     networks:
       - ai_network
 
@@ -159,11 +178,17 @@ services:
     working_dir: /var/www/ai_workers
     volumes:
       - ./:/var/www
-    depends_on:
-      db:
-        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
-      - "8501:8501" # Akses UI Data Mining di port 8501
+      - "8501:8501" 
+    environment:
+      - DB_URL=postgresql://postgres:123@host.docker.internal:5441/ews_pkub 
+      - DB_HOST=host.docker.internal
+      - DB_PORT=5441
+      - DB_DATABASE=ews_pkub
+      - DB_USERNAME=postgres
+      - DB_PASSWORD=123
     command: python3 -m streamlit run app_ews.py --server.port=8501 --server.address=0.0.0.0
     networks:
       - ai_network

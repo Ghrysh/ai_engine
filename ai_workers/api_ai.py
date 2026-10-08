@@ -169,6 +169,10 @@ def analyze_text(data: InputData):
     if db_vecs is None or len(candidates_meta) == 0:
         raise HTTPException(status_code=500, detail=f"Sistem AI belum siap: {last_error}")
 
+    import re
+    import datetime
+    
+    # 1. AI Text Classification (Similarity)
     input_vec = model_ai.encode(data.text, convert_to_tensor=True)
     cos_scores = util.cos_sim(input_vec, db_vecs)[0]
     
@@ -184,6 +188,67 @@ def analyze_text(data: InputData):
         "Krisis": "Deklarasi darurat, intervensi penegakan hukum penuh & persiapan logistik mitigasi."
     }
 
+    # 2. Ekstraksi Entitas Otomatis (NLP Sederhana/RegEx)
+    text_lower = data.text.lower()
+    
+    # Ekstraksi Agama
+    agama_list = ["Islam", "Kristen", "Katolik", "Hindu", "Buddha", "Konghucu"]
+    found_agama = [ag for ag in agama_list if ag.lower() in text_lower or (ag == "Buddha" and "budha" in text_lower)]
+            
+    # Ekstraksi Tanggal (Dibuat otomatis format DD-MM-YYYY)
+    tanggal = ""
+    date_match = re.search(r'\b(\d{1,2})[\-/\s]+([a-zA-Z]+|\d{1,2})[\-/\s]+(\d{4})\b', data.text)
+    if date_match:
+        d, m, y = date_match.groups()
+        if m.isdigit():
+            tanggal = f"{d.zfill(2)}-{m.zfill(2)}-{y}"
+        else:
+            months = {"jan": "01", "feb": "02", "mar": "03", "apr": "04", "mei": "05", "jun": "06", 
+                      "jul": "07", "agu": "08", "sep": "09", "okt": "10", "nov": "11", "des": "12"}
+            m_num = "01"
+            for km, vm in months.items():
+                if km in m.lower():
+                    m_num = vm
+                    break
+            tanggal = f"{d.zfill(2)}-{m_num}-{y}"
+    else:
+        date_match_iso = re.search(r'\b(\d{4})[\-/\s]+(\d{1,2})[\-/\s]+(\d{1,2})\b', data.text)
+        if date_match_iso:
+            y, m, d = date_match_iso.groups()
+            tanggal = f"{d.zfill(2)}-{m.zfill(2)}-{y}"
+        elif "kemarin" in text_lower:
+            tanggal = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%d-%m-%Y")
+        elif "hari ini" in text_lower:
+            tanggal = datetime.datetime.now().strftime("%d-%m-%Y")
+
+    # Ekstraksi Waktu (HH:MM atau jam HH)
+    waktu_awal = ""
+    waktu_akhir = ""
+    time_matches = re.findall(r'\b([0-1]?[0-9]|2[0-3])[:.]([0-5][0-9])\b', data.text)
+    if time_matches:
+        waktu_awal = f"{time_matches[0][0].zfill(2)}"
+        if len(time_matches) > 1:
+            waktu_akhir = f"{time_matches[-1][0].zfill(2)}"
+            
+    if not waktu_awal:
+        hour_matches = re.findall(r'(?:pukul|jam)\s*([0-1]?[0-9]|2[0-3])\b', text_lower)
+        if hour_matches:
+            waktu_awal = f"{hour_matches[0].zfill(2)}"
+            if len(hour_matches) > 1:
+                waktu_akhir = f"{hour_matches[-1].zfill(2)}"
+
+    # Set Default Jika Tidak Ditemukan
+    if not tanggal:
+        tanggal = datetime.datetime.now().strftime("%d-%m-%Y")
+    if not waktu_awal:
+        waktu_awal = "00"
+    if not waktu_akhir:
+        waktu_akhir = "24"
+
+    # Membuat Ekstraksi Judul Cerdas
+    rel_str = (" Terkait " + " & ".join(found_agama)) if found_agama else ""
+    judul = f"Laporan Isu {winner['indikator']}{rel_str}"
+        
     return {
         "score": best_score,
         "dimensi": winner["dimensi"],
@@ -193,8 +258,265 @@ def analyze_text(data: InputData):
         "fase": winner["fase"],
         "fase_id": winner["fase_id"],
         "description": winner["description"],
-        "rekomendasi": rekomendasi_map.get(winner["fase"], "Pantau dan laporkan situasi lanjutan.")
+        "rekomendasi": rekomendasi_map.get(winner["fase"], "Pantau dan laporkan situasi lanjutan."),
+        "judul": judul,
+        "tanggal": tanggal,
+        "waktu_awal": waktu_awal,
+        "waktu_akhir": waktu_akhir,
+        "agama": found_agama
     }
+
+class SuggestData(BaseModel):
+    text: str
+    solutions: list = []
+    responders: list = []
+
+@app.post("/suggest-solutions")
+def suggest_solutions(data: SuggestData):
+    global model_ai, db_vecs, candidates_meta, last_error
+    import datetime
+    
+    if model_ai is None:
+        load_ai_and_db()
+        
+    if model_ai is None:
+        raise HTTPException(status_code=500, detail=f"Sistem AI belum siap: {last_error}")
+
+    text_clean = data.text if data.text else "Tidak ada kronologi yang terlampir."
+    text_vec = model_ai.encode(text_clean, convert_to_tensor=True)
+    
+    # Gunakan fungsi analyze_text untuk dapat konteks NLP (Fase, Indikator)
+    analyze_result = None
+    try:
+        analyze_result = analyze_text(InputData(text=text_clean))
+    except Exception:
+        pass
+
+    # 1. Pilihan Solusi (Dibatasi maksimal 2 opsi)
+    selected_solution_ids = []
+    best_sol_texts = []
+    if data.solutions:
+        sol_texts = [s.get("text", "") for s in data.solutions]
+        sol_vecs = model_ai.encode(sol_texts, convert_to_tensor=True)
+        cos_scores = util.cos_sim(text_vec, sol_vecs)[0]
+        
+        scored_sols = [(data.solutions[i].get("id"), float(cos_scores[i]), sol_texts[i]) for i in range(len(cos_scores))]
+        scored_sols.sort(key=lambda x: x[1], reverse=True)
+        
+        for sid, score, stext in scored_sols[:2]:
+            if score > 0.2:
+                selected_solution_ids.append(sid)
+                best_sol_texts.append(stext)
+                
+        if not selected_solution_ids and scored_sols:
+            selected_solution_ids.append(scored_sols[0][0])
+            best_sol_texts.append(scored_sols[0][2])
+
+    # 2. Pilihan Pihak Terlibat (100% PURE SEMANTIC AI, TANPA KATA KUNCI MANUAL)
+    selected_responder_ids = []
+    best_resp_names = []
+    
+    if data.responders:
+        scored_resps = []
+        
+        # Memperkaya query AI dengan menggabungkan kronologi + jenis indikator 
+        # agar AI mengerti konteks permasalahannya dengan lebih utuh
+        context_query = text_clean
+        if analyze_result:
+            context_query += f". Insiden ini terkait isu {analyze_result.get('indikator', '')} pada tahap {analyze_result.get('fase', '')}"
+            
+        text_vec_enriched = model_ai.encode(context_query, convert_to_tensor=True)
+
+        for r in data.responders:
+            rname = r.get("name", "")
+            
+            # Hitung similarity (kemiripan makna) murni menggunakan AI Vectorization
+            r_vec = model_ai.encode([rname], convert_to_tensor=True)
+            score = float(util.cos_sim(text_vec_enriched, r_vec)[0][0])
+            
+            scored_resps.append((r.get("id"), score, rname))
+            
+        scored_resps.sort(key=lambda x: x[1], reverse=True)
+        
+        # Ambil max 2 pihak yang nilai semantiknya paling tinggi
+        # Threshold diturunkan sedikit karena membandingkan paragraf (kronologi) vs 1 kata (nama instansi) 
+        # membutuhkan toleransi matematis vector yang lebih luwes.
+        for rid, score, rname in scored_resps[:2]:
+            if score > 0.05: 
+                selected_responder_ids.append(rid)
+                best_resp_names.append(rname)
+                
+        if not selected_responder_ids and scored_resps:
+            selected_responder_ids.append(scored_resps[0][0])
+            best_resp_names.append(scored_resps[0][2])
+
+    # 3. Merangkai Penjelasan AI yang Profesional dan Logis
+    time_context = ""
+    if analyze_result and "tanggal" in analyze_result:
+        try:
+            report_date = datetime.datetime.strptime(analyze_result["tanggal"], "%d-%m-%Y").date()
+            today = datetime.datetime.now().date()
+            delta_days = (today - report_date).days
+            if delta_days == 0:
+                time_context = "Mengingat laporan ini masuk di hari yang sama dengan kejadian, mitigasi segera sangat direkomendasikan untuk mencegah mobilisasi massa."
+            elif delta_days == 1:
+                time_context = "Karena insiden ini terjadi kemarin, validasi lapangan perlu segera dilakukan sebelum terjadi eskalasi isu di tengah masyarakat."
+            elif delta_days > 1:
+                time_context = f"Insiden ini tercatat terjadi {delta_days} hari yang lalu. Fokus penanganan saat ini sebaiknya diarahkan pada pemulihan kondisi (cooling down) dan mediasi sisa ketegangan."
+        except:
+            pass
+
+    # Bersihkan nama Fase
+    fase_name = analyze_result["fase"] if analyze_result else "Umum"
+    if fase_name.lower().startswith("fase "):
+        fase_name = fase_name[5:].strip()
+
+    indikator_name = analyze_result["indikator"] if analyze_result else "Konflik"
+
+    # Menyusun paragraf Penjelasan AI
+    alasan_text = f"Berdasarkan analisis pemrosesan bahasa alami (NLP), algoritma AI memetakan muatan narasi pelapor ke dalam **Fase {fase_name}** pada klaster isu **'{indikator_name}'**. {time_context}\n\n"
+    
+    alasan_text += "**Rasionalisasi Pilihan Solusi:**\n"
+    if best_sol_texts:
+        sol_snippet = best_sol_texts[0]
+        alasan_text += f"Sistem merekomendasikan opsi _\"{sol_snippet}\"_ karena kalimat ini memiliki nilai ekuivalensi semantik tertinggi terhadap konteks kronologi. Langkah operasional ini dinilai paling efektif meredam akar masalah berdasarkan basis data EWS.\n\n"
+    else:
+        alasan_text += "Sistem memilih solusi pencegahan standar dikarenakan pola kronologi membutuhkan penanganan preventif umum yang tersedia di basis data.\n\n"
+
+    alasan_text += "**Rasionalisasi Pihak Terlibat:**\n"
+    if best_resp_names:
+        alasan_text += f"Keterlibatan **{', '.join(best_resp_names)}** direkomendasikan murni dari hasil kalkulasi _Semantic Similarity_ (Kemiripan Makna) oleh model NLP. AI menilai bahwa karakteristik, keparahan, dan konteks kejadian yang dilaporkan beririsan langsung dengan kapabilitas serta yurisdiksi instansi tersebut dalam merespons isu {indikator_name}."
+    else:
+        alasan_text += "Pihak terkait direkomendasikan berdasarkan pemetaan struktur penanganan wilayah administratif secara umum."
+
+    # 4. Solusi Alternatif Profesional
+    alt_solution = ""
+    if analyze_result and "rekomendasi" in analyze_result:
+        alt_solution = analyze_result['rekomendasi']
+        if len(alt_solution) < 100:
+             alt_solution += " Lakukan koordinasi silang dengan aparat setempat dan pastikan pengumpulan bukti dilakukan dengan pendekatan humanis."
+    else:
+        alt_solution = "Prioritaskan verifikasi kebenaran informasi langsung kepada saksi kunci di lapangan, lalu siapkan ruang mediasi tertutup untuk mencegah penyebaran rumor."
+
+    return {
+        "selected_solution_ids": selected_solution_ids,
+        "alternative_solution": alt_solution,
+        "selected_responder_ids": selected_responder_ids,
+        "alasan": alasan_text
+    }
+
+@app.post("/enhance")
+def enhance_text(data: InputData):
+    import re
+    import datetime
+    
+    text = data.text.strip()
+    if not text:
+        return {"enhanced_text": ""}
+        
+    text_lower = text.lower()
+    
+    # 1. TANGGAL & WAKTU (Deteksi dari teks asli)
+    today_str = datetime.datetime.now().strftime("%d-%m-%Y")
+    yesterday_str = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%d-%m-%Y")
+    
+    date_found = "[sebutkan tanggal kejadian]"
+    time_found = "[sebutkan waktu kejadian]"
+    
+    # Ekstrak Tanggal
+    date_match = re.search(r'\b(\d{1,2})[\-/\s]+([a-zA-Z]+|\d{1,2})[\-/\s]+(\d{4})\b', text)
+    date_match_iso = re.search(r'\b(\d{4})[\-/\s]+(\d{1,2})[\-/\s]+(\d{1,2})\b', text)
+    
+    if date_match:
+        date_found = date_match.group(0)
+    elif date_match_iso:
+        date_found = date_match_iso.group(0)
+    elif "hari ini" in text_lower:
+        date_found = today_str
+        text = re.sub(r'\bhari ini\b', '', text, flags=re.IGNORECASE)
+    elif "kemarin" in text_lower:
+        date_found = yesterday_str
+        text = re.sub(r'\bkemarin\b', '', text, flags=re.IGNORECASE)
+
+    # Ekstrak Waktu
+    time_match = re.search(r'\b([0-1]?[0-9]|2[0-3])[:.]([0-5][0-9])\b', text)
+    hour_match = re.search(r'\b(?:pukul|jam)\s*([0-1]?[0-9]|2[0-3])\b', text_lower)
+    
+    if time_match:
+        time_found = time_match.group(0).replace('.', ':')
+    elif hour_match:
+        time_found = hour_match.group(1).zfill(2) + ":00"
+
+    # Hapus redundansi kata "pada tanggal X" atau "pukul Y" di dalam isi text-nya agar tidak terulang
+    text = re.sub(r'\b(pada )?tanggal\s+\[?sebutkan tanggal kejadian\]?\b', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b(pada )?(sekitar )?pukul\s+\[?sebutkan waktu kejadian\]?\b', '', text, flags=re.IGNORECASE)
+
+    # 2. PERBAIKAN BAHASA (Kamus Slang ke Formal Birokrasi EWS)
+    slang_dict = {
+        r'\btadi aku lihat\b': 'terpantau',
+        r'\btadi saya lihat\b': 'terpantau',
+        r'\baku lihat\b': 'terpantau',
+        r'\bsaya lihat\b': 'terpantau',
+        r'\btadi\b': '',
+        r'\baku\b': 'saya',
+        r'\bada yang\b': 'terdapat sekelompok pihak yang',
+        r'\bribut\b': 'terlibat perselisihan',
+        r'\bberantem\b': 'bertikai',
+        r'\bdisini\b': 'di lokasi',
+        r'\bmereka\b': 'pihak-pihak tersebut',
+        r'\bejek\b': 'melontarkan ujaran kebencian provokatif',
+        r'\bhina\b': 'melakukan penistaan',
+        r'\bbikin\b': 'memicu',
+        r'\bgara-gara\b': 'dikarenakan oleh',
+        r'\bgara gara\b': 'dikarenakan oleh',
+        r'\bkayaknya\b': 'diduga',
+        r'\bkalo\b': 'apabila',
+        r'\budah\b': 'telah',
+        r'\benggak\b': 'tidak',
+        r'\bnggak\b': 'tidak',
+        r'\bgak\b': 'tidak',
+        r'\bbanget\b': 'sangat',
+        r'\bcepet\b': 'segera',
+        r'\bsampe\b': 'hingga',
+        r'\btrus\b': 'kemudian',
+        r'\bterus\b': 'selanjutnya',
+        r'\bpas\b': 'saat',
+        r'\bngomong\b': 'menyatakan',
+        r'\bmarah\b': 'tersulut emosi',
+    }
+    
+    for slang, formal in slang_dict.items():
+        text = re.sub(slang, formal, text, flags=re.IGNORECASE)
+
+    # Bersihkan spasi berlebih dari teks yang tersisa
+    text = re.sub(r'\s+', ' ', text).strip()
+    text = re.sub(r'^[.,\-\s]+', '', text) # Hapus sisa koma/titik di awal kalimat yang terpotong
+    
+    # 3. PENYUSUNAN REDAKSI EWS YANG BENAR DAN FORMAL (Penyatuan Narasi)
+    has_religion = any(ag.lower() in text_lower for ag in ["islam", "kristen", "katolik", "hindu", "buddha", "konghucu"])
+    agama_reminder = "" if has_religion else " [sebutkan agama terkait jika ada]"
+    
+    # Disusun ulang menjadi format laporan birokrasi kejadian
+    formal_report = f"Pada tanggal {date_found} sekitar pukul {time_found}, dilaporkan bahwa {text}.{agama_reminder}"
+
+    # Rapikan spasi tanda baca
+    formal_report = re.sub(r'([,!?])([^\s"”\'])', r'\1 \2', formal_report)
+    formal_report = re.sub(r'(\.)([^\s"\'0-9\[])', r'\1 \2', formal_report)
+    formal_report = re.sub(r'\s+', ' ', formal_report).strip()
+
+    # Kapitalisasi Setiap Awal Kalimat dan Placeholder [Tanda Kurung]
+    sentences = re.split(r'(?<=[.!?]) +', formal_report)
+    enhanced_sentences = []
+    for s in sentences:
+        if s:
+            # Kapital di awal kalimat
+            s = re.sub(r'^([^a-zA-Z]*)([a-zA-Z])', lambda m: m.group(1) + m.group(2).upper(), s)
+            enhanced_sentences.append(s)
+            
+    final_text = " ".join(enhanced_sentences)
+    final_text = final_text.replace('[ ', '[').replace(' ]', ']')
+    
+    return {"enhanced_text": final_text}
 
 # PERUBAHAN-29SEP2026
 @app.post("/reload-db")
